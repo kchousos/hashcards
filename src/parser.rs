@@ -246,12 +246,18 @@ impl Line {
             Line::StartDefinition(line_content(line))
         } else if line.starts_with("C:") {
             Line::StartCloze(line_content(line))
-        } else if line.trim() == "---" {
+        } else if is_separator(line) {
             Line::Separator
         } else {
             Line::Text(line.to_string())
         }
     }
+}
+
+/// A flashcard separator: a line of three or more dashes.
+fn is_separator(line: &str) -> bool {
+    let trimmed = line.trim();
+    trimmed.len() >= 3 && trimmed.bytes().all(|b| b == b'-')
 }
 
 /// Remove the line type, e.g. remove `Q:`, and trim.
@@ -321,17 +327,9 @@ impl Parser {
                     start_line: line_num,
                 }),
                 Line::Separator => Ok(State::Start),
-                Line::Text(text) => {
-                    if text.trim().is_empty() {
-                        Ok(State::Start)
-                    } else {
-                        Err(ParserError::new(
-                            "Found text that doesn't parse as a flashcard. Did you forget a 'Q:' or 'C:' tag?",
-                            self.file_path.clone(),
-                            line_num,
-                        ))
-                    }
-                }
+                // Text outside a flashcard is ignored, so that decks can carry
+                // prose, headings, and editor mode lines around their cards.
+                Line::Text(_) => Ok(State::Start),
                 Line::Eof => Ok(State::End),
             },
             State::ReadingQuestion {
@@ -1564,25 +1562,31 @@ A: Genetic material."#,
     }
 
     #[test]
-    fn test_unparseable_text_between_separators_errors() -> Result<(), ParserError> {
-        let input = "Q: foo\nA: bar\n\n---\n\nI'm a mistake!\n\n---\n\nQ: baz\nA: quux";
+    fn test_text_between_separators_is_ignored() -> Result<(), ParserError> {
+        let input = "Q: foo\nA: bar\n\n---\n\nI'm prose!\n\n---\n\nQ: baz\nA: quux";
         let parser = make_test_parser();
-        let result = parser.parse(input);
+        let cards = parser.parse(input)?;
 
-        assert!(result.is_err());
-        if let Err(e) = result {
-            assert!(e.to_string().contains("doesn't parse as a flashcard"));
-        }
+        assert_eq!(cards.len(), 2);
         Ok(())
     }
 
     #[test]
-    fn test_unparseable_text_at_start_errors() -> Result<(), ParserError> {
-        let input = "This is stray text.\n\nQ: foo\nA: bar";
+    fn test_preamble_at_start_is_ignored() -> Result<(), ParserError> {
+        // Decks written as Org-mode files start with a mode line, keywords, and
+        // headings, none of which are flashcards.
+        let input = "# -*- mode: org; -*-\n#+title: Algorithms\n\nCourse note: [[20250928183217]]\n\n* Heading\n\nQ: foo\nA: bar";
         let parser = make_test_parser();
-        let result = parser.parse(input);
+        let cards = parser.parse(input)?;
 
-        assert!(result.is_err());
+        assert_eq!(cards.len(), 1);
+        assert!(matches!(
+            &cards[0].content(),
+            CardContent::Basic {
+                question,
+                answer,
+            } if question == "foo" && answer == "bar"
+        ));
         Ok(())
     }
 
