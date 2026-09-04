@@ -58,6 +58,8 @@ pub struct ReviewRow {
 }
 
 impl Database {
+    /// Create or open a database handle at the given path. If the file does
+    /// not exist, a new database is created and the tables are created.
     pub fn new(database_path: &str) -> Fallible<Self> {
         let mut conn = Connection::open(database_path)?;
         conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)?;
@@ -98,8 +100,11 @@ impl Database {
         Ok(card_hashes)
     }
 
-    /// Find the hashes of the cards due today.
-    pub fn due_today(&self, today: Date) -> Fallible<HashSet<CardHash>> {
+    /// Find the hashes of:
+    ///
+    /// 1. Cards due on or before the given date, and
+    /// 2. New cards.
+    pub fn all_due(&self, today: Date) -> Fallible<HashSet<CardHash>> {
         let mut due = HashSet::new();
         let sql = "select card_hash, due_date from cards;";
         let mut stmt = self.conn.prepare(sql)?;
@@ -118,6 +123,19 @@ impl Database {
                     }
                 }
             }
+        }
+        Ok(due)
+    }
+
+    /// Find the hashes of the cards due on exactly the given date.
+    pub fn due_on(&self, date: Date) -> Fallible<HashSet<CardHash>> {
+        let mut due = HashSet::new();
+        let sql = "select card_hash from cards where due_date = ?1;";
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query(params![date])?;
+        while let Some(row) = rows.next()? {
+            let hash: CardHash = row.get(0)?;
+            due.insert(hash);
         }
         Ok(due)
     }
@@ -257,17 +275,16 @@ impl Database {
         Ok(())
     }
 
-    /// Delete a card and its reviews.
-    ///
-    /// If no card with the given hash exists, returns an error.
-    pub fn delete_card(&self, card_hash: CardHash) -> Fallible<()> {
-        if !self.card_exists(card_hash)? {
-            return fail("Card not found");
+    /// Delete a set of cards.
+    pub fn delete_cards(&mut self, cards: &[CardHash]) -> Fallible<()> {
+        let tx = self.conn.transaction()?;
+        for card_hash in cards {
+            let sql = "delete from reviews where card_hash = ?;";
+            tx.execute(sql, params![card_hash])?;
+            let sql = "delete from cards where card_hash = ?;";
+            tx.execute(sql, params![card_hash])?;
         }
-        let sql = "delete from reviews where card_hash = ?;";
-        self.conn.execute(sql, params![card_hash])?;
-        let sql = "delete from cards where card_hash = ?;";
-        self.conn.execute(sql, params![card_hash])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -276,6 +293,20 @@ impl Database {
         let sql = "select count(*) from cards where card_hash = ?;";
         let count: i64 = self.conn.query_row(sql, [card_hash], |row| row.get(0))?;
         Ok(count > 0)
+    }
+
+    /// Construct a map from the hash of each card to its due date.
+    pub fn card_due_dates(&self) -> Fallible<HashMap<CardHash, Option<Date>>> {
+        let sql = "select card_hash, due_date from cards;";
+        let mut stmt = self.conn.prepare(sql)?;
+        let mut rows = stmt.query([])?;
+        let mut map = HashMap::new();
+        while let Some(row) = rows.next()? {
+            let hash: CardHash = row.get(0)?;
+            let due_date: Option<Date> = row.get(1)?;
+            map.insert(hash, due_date);
+        }
+        Ok(map)
     }
 
     /// Count the number of reviews performed in the given date.
@@ -326,6 +357,33 @@ impl Database {
             sessions.push(session?);
         }
         Ok(sessions)
+    }
+
+    /// Get the list of all reviews for a given card, ordered from least to
+    /// most recent.
+    pub fn get_reviews_for_card(&self, card_hash: CardHash) -> Fallible<Vec<ReviewRow>> {
+        let sql = "select review_id, card_hash, reviewed_at, grade, stability, difficulty, interval_raw, interval_days, due_date from reviews where card_hash = ? order by reviewed_at asc;";
+        let mut stmt = self.conn.prepare(sql)?;
+        let review_iter = stmt.query_map(params![card_hash], |row| {
+            Ok(ReviewRow {
+                review_id: row.get(0)?,
+                data: ReviewRecord {
+                    card_hash: row.get(1)?,
+                    reviewed_at: row.get(2)?,
+                    grade: row.get(3)?,
+                    stability: row.get(4)?,
+                    difficulty: row.get(5)?,
+                    interval_raw: row.get(6)?,
+                    interval_days: row.get(7)?,
+                    due_date: row.get(8)?,
+                },
+            })
+        })?;
+        let mut reviews = Vec::new();
+        for review in review_iter {
+            reviews.push(review?);
+        }
+        Ok(reviews)
     }
 
     /// Get the list of all reviews for a given session.
@@ -388,7 +446,7 @@ mod tests {
         assert!(hashes.contains(&card_hash));
         let performance = db.get_card_performance(card_hash)?;
         assert_eq!(performance, Performance::New);
-        let due_today = db.due_today(now.date())?;
+        let due_today = db.all_due(now.date())?;
         assert!(due_today.contains(&card_hash));
         Ok(())
     }
@@ -427,8 +485,42 @@ mod tests {
         db.update_card_performance(card_hash, performance)?;
         let fetched_performance = db.get_card_performance(card_hash)?;
         assert_eq!(fetched_performance, performance);
-        let due_today = db.due_today(now.date())?;
+        let due_today = db.all_due(now.date())?;
         assert!(due_today.contains(&card_hash));
+        Ok(())
+    }
+
+    /// A forgotten reviewed card is persisted as due today and is selected
+    /// when a later session queries today's due cards.
+    #[test]
+    fn test_forgotten_reviewed_card_is_due_in_later_same_day_session() -> Fallible<()> {
+        let db = Database::new(":memory:")?;
+        let card_hash = CardHash::hash_bytes(b"a");
+        let now = Timestamp::now();
+        let three_days = chrono::Duration::days(3);
+        db.insert_card(card_hash, now)?;
+
+        let previous = ReviewedPerformance {
+            last_reviewed_at: Timestamp::new(now.into_inner() - three_days),
+            stability: 3.17,
+            difficulty: 5.28,
+            interval_raw: 3.17,
+            interval_days: 3,
+            due_date: now.date(),
+            review_count: 1,
+        };
+        let forgotten = crate::types::performance::update_performance(
+            Performance::Reviewed(previous),
+            Grade::Forgot,
+            now,
+        );
+        db.update_card_performance(card_hash, Performance::Reviewed(forgotten))?;
+
+        assert_eq!(forgotten.interval_days, 0);
+        assert_eq!(forgotten.due_date, now.date());
+        assert!(db.all_due(now.date())?.contains(&card_hash));
+        let tomorrow = Date::new(now.date().into_inner() + chrono::Duration::days(1));
+        assert!(db.all_due(tomorrow)?.contains(&card_hash));
         Ok(())
     }
 
@@ -498,6 +590,38 @@ mod tests {
         Ok(())
     }
 
+    /// `get_reviews_for_card` returns only the reviews for the given card,
+    /// ordered from least to most recent.
+    #[test]
+    fn test_get_reviews_for_card() -> Fallible<()> {
+        let mut db = Database::new(":memory:")?;
+        let card_a = CardHash::hash_bytes(b"a");
+        let card_b = CardHash::hash_bytes(b"b");
+        let day1 = Timestamp::try_from("2026-05-20T09:00:00.000".to_string())?;
+        let day2 = Timestamp::try_from("2026-05-22T09:00:00.000".to_string())?;
+        db.insert_card(card_a, day1)?;
+        db.insert_card(card_b, day1)?;
+        let mk = |card_hash: CardHash, ts: Timestamp| ReviewRecord {
+            card_hash,
+            reviewed_at: ts,
+            grade: Grade::Good,
+            stability: 1.0,
+            difficulty: 1.0,
+            interval_raw: 0.0,
+            interval_days: 0,
+            due_date: ts.date(),
+        };
+        db.save_session(day1, day1, vec![mk(card_a, day1), mk(card_b, day1)])?;
+        db.save_session(day2, day2, vec![mk(card_a, day2)])?;
+
+        let reviews = db.get_reviews_for_card(card_a)?;
+        assert_eq!(reviews.len(), 2);
+        assert_eq!(reviews[0].data.reviewed_at, day1);
+        assert_eq!(reviews[1].data.reviewed_at, day2);
+        assert!(reviews.iter().all(|r| r.data.card_hash == card_a));
+        Ok(())
+    }
+
     /// `review_counts_in_range` returns review counts grouped by date.
     #[test]
     fn test_review_counts_in_range() -> Fallible<()> {
@@ -542,26 +666,14 @@ mod tests {
         Ok(())
     }
 
-    /// Trying to delete a non-existent card returns an error.
-    #[test]
-    fn test_delete_nonexistent_card() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
-        let card_hash = CardHash::hash_bytes(b"a");
-        let result = db.delete_card(card_hash);
-        assert!(result.is_err());
-        let err = result.err().unwrap();
-        assert_eq!(err.to_string(), "error: Card not found");
-        Ok(())
-    }
-
     /// Delete a card and see that it is gone.
     #[test]
     fn test_delete_card() -> Fallible<()> {
-        let db = Database::new(":memory:")?;
+        let mut db = Database::new(":memory:")?;
         let card_hash = CardHash::hash_bytes(b"a");
         let now = Timestamp::now();
         db.insert_card(card_hash, now)?;
-        db.delete_card(card_hash)?;
+        db.delete_cards(&[card_hash])?;
         let result = db.get_card_performance(card_hash);
         assert!(result.is_err());
         let err = result.err().unwrap();

@@ -133,7 +133,11 @@ Options:
 
 - `--card-limit=<N>`: Limit the session to at most N cards.
 - `--new-card-limit=<N>`: Limit the number of new cards in the session.
+- `--host=<HOST>`: Bind the web server to a specific host address (default:
+  127.0.0.1).
 - `--port=<PORT>`: Use a specific port (default: 8000).
+- `--resource-hostname=<HOSTNAME>`: Use a specific hostname when rewriting
+  linked media resource URLs (default: localhost).
 - `--from-deck=<NAME>`: Only drill cards from a deck with the given name.
 - `--open-browser=<true|false>`: Whether or not to open the browser after the
   server starts (default: true).
@@ -242,6 +246,23 @@ Better is the sight of the eyes than the wandering of the
 desire: this is also vanity and vexation of spirit.
 
 — [Ecclesiastes] [6]:[9]
+```
+
+### Term-definition Cards
+
+A shorthand for writing a cloze card for a term definition. Writing:
+
+```
+T: lithification
+D: The process of turning loose sediment into rock.
+```
+
+Is equivalent to writing:
+
+```
+C: Term: [lithification]
+
+Definition: [The process of turning loose sediment into rock.]
 ```
 
 ### Separators

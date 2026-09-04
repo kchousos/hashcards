@@ -18,10 +18,13 @@ use clap::Parser;
 use clap::Subcommand;
 use tokio::spawn;
 
+use crate::cmd::browse::BrowseServerConfig;
+use crate::cmd::browse::start_browse_server;
 use crate::cmd::check::check_collection;
 use crate::cmd::drill::server::AnswerControls;
 use crate::cmd::drill::server::ServerConfig;
 use crate::cmd::drill::server::start_server;
+use crate::cmd::due::parse_date_arg;
 use crate::cmd::due::print_due;
 use crate::cmd::export::export_collection;
 use crate::cmd::orphans::delete_orphans;
@@ -48,6 +51,9 @@ enum Command {
         /// The host address to bind to. Default is 127.0.0.1.
         #[arg(long, default_value = "127.0.0.1")]
         host: String,
+        /// The hostname to use when rewriting linked resource URLs. Default is localhost.
+        #[arg(long, default_value = "localhost")]
+        resource_hostname: String,
         /// The port to use for the web server. Default is 8000.
         #[arg(long, default_value_t = 8000)]
         port: u16,
@@ -64,10 +70,30 @@ enum Command {
         #[arg(long)]
         bury_siblings: Option<bool>,
     },
-    /// Print which decks have cards due today.
+    /// Browse a flashcard collection through a web interface.
+    Browse {
+        /// Path to the collection directory. By default, the current working directory is used.
+        directory: Option<String>,
+        /// The host address to bind to. Default is 127.0.0.1.
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// The hostname to use when rewriting linked resource URLs. Default is localhost.
+        #[arg(long, default_value = "localhost")]
+        resource_hostname: String,
+        /// The port to use for the web server. Default is 8000.
+        #[arg(long, default_value_t = 8000)]
+        port: u16,
+        /// Whether to open the browser automatically. Default is true.
+        #[arg(long)]
+        open_browser: Option<bool>,
+    },
+    /// Print which decks have cards due on a given date.
     Due {
         /// Path to the collection directory. By default, the current working directory is used.
         directory: Option<String>,
+        /// Date to check: 'today' (default), 'tomorrow', or YYYY-MM-DD.
+        #[arg(default_value = "today")]
+        date: String,
     },
     /// Check the integrity of a collection.
     Check {
@@ -119,6 +145,7 @@ pub async fn entrypoint() -> Fallible<()> {
             card_limit,
             new_card_limit,
             host,
+            resource_hostname,
             port,
             from_deck,
             open_browser,
@@ -143,6 +170,7 @@ pub async fn entrypoint() -> Fallible<()> {
             let config = ServerConfig {
                 directory,
                 host,
+                resource_hostname,
                 port,
                 session_started_at: Timestamp::now(),
                 card_limit,
@@ -154,7 +182,37 @@ pub async fn entrypoint() -> Fallible<()> {
             };
             start_server(config).await
         }
-        Command::Due { directory } => print_due(directory),
+        Command::Browse {
+            directory,
+            host,
+            resource_hostname,
+            port,
+            open_browser,
+        } => {
+            if open_browser.unwrap_or(true) {
+                // Start a separate task to open the browser once the server is up.
+                let browser_host = host.clone();
+                spawn(async move {
+                    match wait_for_server(&browser_host, port).await {
+                        Ok(_) => {
+                            let _ = open::that(format!("http://{browser_host}:{port}/"));
+                        }
+                        Err(e) => {
+                            eprintln!("Failed to connect to server: {e}");
+                            exit(-1)
+                        }
+                    }
+                });
+            };
+            let config = BrowseServerConfig {
+                directory,
+                host,
+                resource_hostname,
+                port,
+            };
+            start_browse_server(config).await
+        }
+        Command::Due { directory, date } => print_due(directory, parse_date_arg(&date)?),
         Command::Check { directory } => check_collection(directory),
         Command::Stats { directory, format } => print_stats(directory, format),
         Command::Orphans { command } => match command {

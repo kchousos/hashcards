@@ -33,24 +33,27 @@ use crate::types::card::CardType;
 pub async fn get_handler(State(state): State<ServerState>) -> (StatusCode, Html<String>) {
     let html = match inner(state).await {
         Ok(html) => html,
-        Err(e) => page_template(html! {
-            div.error {
-                h1 { "Error" }
-                p { (e) }
-            }
-        }),
+        Err(e) => page_template(
+            html! {
+                div.error {
+                    h1 { "Error" }
+                    p { (e) }
+                }
+            },
+            None,
+        ),
     };
     (StatusCode::OK, Html(html.into_string()))
 }
 
 async fn inner(state: ServerState) -> Fallible<Markup> {
     let mutable = state.mutable.lock().unwrap();
-    let body = if mutable.finished_at.is_some() {
-        render_completion_page(&state, &mutable)?
+    let (body, stylesheet) = if mutable.finished_at.is_some() {
+        (render_completion_page(&state, &mutable)?, "/finished.css")
     } else {
-        render_session_page(&state, &mutable)?
+        (render_session_page(&state, &mutable)?, "/drill.css")
     };
-    let html = page_template(body);
+    let html = page_template(body, Some(stylesheet));
     Ok(html)
 }
 
@@ -69,6 +72,7 @@ fn render_session_page(state: &ServerState, mutable: &MutableState) -> Fallible<
             .with_collection_path(coll_path)?
             .with_deck_path(deck_path)?
             .build()?,
+        resource_hostname: state.resource_hostname.clone(),
         port: state.port,
     };
     let card_content = render_card(&card, mutable.reveal, &config)?;

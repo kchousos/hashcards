@@ -1,6 +1,6 @@
 [package]
 name = "hashcards"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 description = "A plain text-based spaced repetition system."
 homepage = "https://github.com/eudoxia0/hashcards"
@@ -11,15 +11,16 @@ categories = ["command-line-utilities"]
 [dependencies]
 axum = "0.8.8"
 blake3 = "1.8.3"
-chrono = "0.4.44"
+chrono = "0.4.45"
 clap = { version = "4.6.0", features = ["derive"] }
 env_logger = "0.11.10"
-log = "0.4.29"
+http = "1.4.2"
+log = "0.4.32"
 maud = "0.27.0"
 open = "5.3.3"
 percent-encoding = "2.3.2"
 pulldown-cmark = "0.13.3"
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "fs", "signal"] }

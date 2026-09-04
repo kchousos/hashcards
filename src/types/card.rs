@@ -20,6 +20,7 @@ use maud::PreEscaped;
 use maud::html;
 
 use crate::error::Fallible;
+use crate::error::fail;
 use crate::markdown::MarkdownRenderConfig;
 use crate::markdown::markdown_to_html;
 use crate::markdown::markdown_to_html_inline;
@@ -67,6 +68,7 @@ pub enum CardType {
 }
 
 impl Card {
+    /// Construct a new card.
     pub fn new(
         deck_name: DeckName,
         file_path: PathBuf,
@@ -83,23 +85,28 @@ impl Card {
         }
     }
 
+    /// The name of the deck this card was parsed from.
     pub fn deck_name(&self) -> &DeckName {
         &self.deck_name
     }
 
+    /// The card's content.
     pub fn content(&self) -> &CardContent {
         &self.content
     }
 
+    /// The card's hash.
     pub fn hash(&self) -> CardHash {
         self.hash
     }
 
+    /// The card's family hash. This value is the same for all cloze cards
+    /// parsed from the same source text.
     pub fn family_hash(&self) -> Option<CardHash> {
         self.content.family_hash()
     }
 
-    /// Return the absolute path of the file this card was parsed from.
+    /// The absolute path of the file this card was parsed from.
     pub fn file_path(&self) -> &PathBuf {
         &self.file_path
     }
@@ -116,10 +123,13 @@ impl Card {
         Ok(result)
     }
 
+    /// The line range of the card's source text, in the file this card was
+    /// parsed from.
     pub fn range(&self) -> (usize, usize) {
         self.range
     }
 
+    /// Whether this is a basic or cloze card.
     pub fn card_type(&self) -> CardType {
         match &self.content {
             CardContent::Basic { .. } => CardType::Basic,
@@ -127,16 +137,38 @@ impl Card {
         }
     }
 
+    /// The HTML of the front of the card.
     pub fn html_front(&self, config: &MarkdownRenderConfig) -> Fallible<Markup> {
         self.content.html_front(config)
     }
 
+    /// The HTML of the back of the card.
     pub fn html_back(&self, config: &MarkdownRenderConfig) -> Fallible<Markup> {
         self.content.html_back(config)
+    }
+
+    /// Render the back of a cloze family, revealing every cloze deletion in
+    /// the family at once, rather than just the one deletion belonging to a
+    /// single card.
+    ///
+    /// `family` must be a non-empty slice of cloze cards that all share the
+    /// same family hash.
+    pub fn html_back_family(family: &[&Card], config: &MarkdownRenderConfig) -> Fallible<Markup> {
+        let contents: Vec<&CardContent> = family.iter().map(|card| &card.content).collect();
+        CardContent::html_back_family(&contents, config)
+    }
+
+    /// For a cloze card: return the text under the cloze.
+    ///
+    /// If the card is a basic card, panic.
+    #[cfg(test)]
+    pub fn cloze_text(&self) -> Fallible<String> {
+        self.content().cloze_text()
     }
 }
 
 impl CardContent {
+    /// Construct a basic [`CardContent`].
     pub fn new_basic(question: impl Into<String>, answer: impl Into<String>) -> Self {
         Self::Basic {
             question: question.into().trim().to_string(),
@@ -144,6 +176,7 @@ impl CardContent {
         }
     }
 
+    /// Construct a cloze [`CardContent`].
     pub fn new_cloze(prompt: impl Into<String>, start: usize, end: usize) -> Self {
         Self::Cloze {
             text: prompt.into(),
@@ -152,6 +185,27 @@ impl CardContent {
         }
     }
 
+    /// Given a term and a definition, generate a pair of cloze [`CardContent`]
+    /// values.
+    pub fn new_cloze_pair_from_term_definition(term: &str, definition: &str) -> [Self; 2] {
+        let term: &str = term.trim();
+        let definition: &str = definition.trim();
+        let text: String = format!("Term: {term}\n\nDefinition: {definition}");
+        [
+            Self::Cloze {
+                text: text.clone(),
+                start: 6,
+                end: 6 + term.len() - 1,
+            },
+            Self::Cloze {
+                text,
+                start: 20 + term.len(),
+                end: 20 + term.len() + definition.len() - 1,
+            },
+        ]
+    }
+
+    /// The hash of the card content.
     pub fn hash(&self) -> CardHash {
         let mut hasher = Hasher::new();
         match &self {
@@ -232,6 +286,88 @@ impl CardContent {
             }
         };
         Ok(html)
+    }
+
+    /// For a cloze card: return the text under the cloze.
+    ///
+    /// If the card is a basic card, panic.
+    #[cfg(test)]
+    pub fn cloze_text(&self) -> Fallible<String> {
+        match self {
+            CardContent::Cloze { text, start, end } => {
+                let bytes: Vec<u8> = text.as_bytes()[*start..*end + 1].to_owned();
+                Ok(String::from_utf8(bytes)?)
+            }
+            CardContent::Basic { .. } => {
+                panic!("Called `CardContent::cloze_text` with a basic card.")
+            }
+        }
+    }
+
+    /// Render the back of a cloze family, revealing every cloze deletion at
+    /// once. See [`Card::html_back_family`].
+    fn html_back_family(
+        family: &[&CardContent],
+        config: &MarkdownRenderConfig,
+    ) -> Fallible<Markup> {
+        let mut text: Option<&str> = None;
+        let mut spans: Vec<(usize, usize)> = Vec::with_capacity(family.len());
+        for content in family {
+            match content {
+                CardContent::Cloze {
+                    text: t,
+                    start,
+                    end,
+                } => {
+                    match text {
+                        None => text = Some(t),
+                        Some(existing) if existing == t => {}
+                        Some(_) => {
+                            return fail(
+                                "html_back_family called with cards from different cloze families",
+                            );
+                        }
+                    }
+                    spans.push((*start, *end));
+                }
+                CardContent::Basic { .. } => {
+                    return fail("html_back_family called with a basic card");
+                }
+            }
+        }
+        let Some(text) = text else {
+            return fail("html_back_family called with an empty family");
+        };
+        spans.sort_by_key(|&(start, _)| start);
+
+        let text_bytes: &[u8] = text.as_bytes();
+        let mut marked_bytes: Vec<u8> = Vec::new();
+        let mut deleted_texts: Vec<String> = Vec::with_capacity(spans.len());
+        let mut cursor: usize = 0;
+        for (i, &(start, end)) in spans.iter().enumerate() {
+            marked_bytes.extend_from_slice(&text_bytes[cursor..start]);
+            let deleted_bytes: Vec<u8> = text_bytes[start..end + 1].to_owned();
+            deleted_texts.push(String::from_utf8(deleted_bytes)?);
+            // The trailing letter ensures the tag for one index (e.g. "1") is
+            // never a prefix of the tag for another (e.g. "10").
+            marked_bytes.extend_from_slice(format!("{CLOZE_TAG}{i}Z").as_bytes());
+            cursor = end + 1;
+        }
+        marked_bytes.extend_from_slice(&text_bytes[cursor..]);
+        let marked_text: String = String::from_utf8(marked_bytes)?;
+
+        let mut html: String = markdown_to_html(config, &marked_text)?;
+        for (i, deleted_text) in deleted_texts.iter().enumerate() {
+            let deleted_html: String = markdown_to_html_inline(config, deleted_text)?;
+            let tag = format!("{CLOZE_TAG}{i}Z");
+            html = html.replace(
+                &tag,
+                &format!("<span class='cloze-reveal'>{deleted_html}</span>"),
+            );
+        }
+        Ok(html! {
+            (PreEscaped(html))
+        })
     }
 }
 
